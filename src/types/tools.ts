@@ -20,7 +20,11 @@ export interface ToolDefinition {
       description?: string;
       optional?: boolean;
       enum?: string[];
-      items?: { type: string };
+      items?: {
+        type: string;
+        properties?: Record<string, { type: string; description?: string }>;
+        required?: string[];
+      };
     }>;
     required?: string[];
   };

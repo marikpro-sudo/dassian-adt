@@ -100,7 +100,15 @@ export class ObjectHandlers extends BaseHandler {
           properties: {
             objects: {
               type: 'array',
-              description: 'List of objects to activate. Each item must be an object with "name" (e.g. /DSN/MY_CLASS) and "type" (e.g. CLAS, PROG/P, DDLS).'
+              description: 'List of objects to activate. Each item must be an object with "name" (e.g. /DSN/MY_CLASS) and "type" (e.g. CLAS, PROG/P, DDLS).',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'ABAP object name' },
+                  type: { type: 'string', description: 'ABAP object type, e.g. CLAS or PROG/P' }
+                },
+                required: ['name', 'type']
+              }
             }
           },
           required: ['objects']

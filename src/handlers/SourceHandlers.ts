@@ -3,6 +3,7 @@ import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import { buildClassIncludeUrl, buildObjectUrl, buildSourceUrl, getSupportedTypes, NESTED_TYPES } from '../lib/urlBuilder.js';
 import { formatError, parseAdtError } from '../lib/errors.js';
+import { readFileSync } from 'node:fs';
 
 const SUPPORTED = getSupportedTypes().join(', ');
 
@@ -47,6 +48,8 @@ export class SourceHandlers extends BaseHandler {
         annotations: { idempotentHint: true },
         description:
           'Write ABAP source code for an object. Handles lock → write → unlock automatically. ' +
+          'Provide the source inline (source) OR as a path to a local file (sourceFile) — use sourceFile ' +
+          'for large sources so the whole thing is not emitted inline in the tool call. ' +
           'For objects outside $TMP, provide a transport number. ' +
           'PREFER abap_edit_method when changing one method of an existing class — it edits surgically ' +
           'without regenerating (and risking clobbering) the rest of the source. ' +
@@ -64,7 +67,11 @@ export class SourceHandlers extends BaseHandler {
             },
             source: {
               type: 'string',
-              description: 'Full ABAP source code to write'
+              description: 'Full ABAP source code to write. Use sourceFile instead for large sources — avoids emitting the whole source inline in the tool call.'
+            },
+            sourceFile: {
+              type: 'string',
+              description: 'Path to a local file whose contents are used as the source (read server-side, on the machine running this MCP server). Required if source is omitted. Takes precedence over source when both are given. Ideal for large generated sources (tens/hundreds of KB).'
             },
             transport: {
               type: 'string',
@@ -75,7 +82,7 @@ export class SourceHandlers extends BaseHandler {
               description: 'Parent function group name. Required for FUGR/FF if auto-discovery fails. E.g. if FM is /DSN/010BWE_SC, fugr is /DSN/010BWE.'
             }
           },
-          required: ['name', 'type', 'source']
+          required: ['name', 'type']
         }
       },
       {
@@ -129,14 +136,18 @@ export class SourceHandlers extends BaseHandler {
             },
             source: {
               type: 'string',
-              description: 'Full source to write into the include'
+              description: 'Full source to write into the include. Use sourceFile instead for large sources — avoids emitting the whole source inline.'
+            },
+            sourceFile: {
+              type: 'string',
+              description: 'Path to a local file whose contents are used as the include source (read server-side). Required if source is omitted. Takes precedence over source when both are given.'
             },
             transport: {
               type: 'string',
               description: 'Transport request number. Required for objects outside $TMP.'
             }
           },
-          required: ['name', 'include_type', 'source']
+          required: ['name', 'include_type']
         }
       },
       {
@@ -520,7 +531,36 @@ export class SourceHandlers extends BaseHandler {
     }
   }
 
+  /**
+   * Resolve source content from args.source (inline) or args.sourceFile (local path).
+   * Large sources should be passed via sourceFile so the caller (e.g. an LLM) does not
+   * have to emit the whole source inline in the tool call. The file is read server-side,
+   * on the machine running this MCP server.
+   */
+  private resolveSource(args: any, label: string): string {
+    const sourceFile = typeof args?.sourceFile === 'string' ? args.sourceFile.trim() : '';
+    if (sourceFile) {
+      let src: string;
+      try {
+        src = readFileSync(sourceFile, 'utf8');
+      } catch (e: any) {
+        this.fail(`${label}: cannot read sourceFile '${sourceFile}': ${e?.message || e}`);
+      }
+      if (src.charCodeAt(0) === 0xFEFF) src = src.slice(1); // strip UTF-8 BOM
+      if (src.length === 0) {
+        this.fail(`${label}: sourceFile '${sourceFile}' is empty.`);
+      }
+      return src;
+    }
+    if (typeof args?.source === 'string' && args.source.length > 0) {
+      return args.source;
+    }
+    this.fail(`${label}: provide either 'source' (inline) or 'sourceFile' (path to a local file).`);
+  }
+
   private async handleSetSource(args: any): Promise<any> {
+    args.source = this.resolveSource(args, `abap_set_source(${args.name})`);
+
     let objectUrl: string;
     let sourceUrl: string;
 
@@ -681,7 +721,8 @@ export class SourceHandlers extends BaseHandler {
   }
 
   private async handleSetClassInclude(args: any): Promise<any> {
-    const { name, include_type, source, transport } = args;
+    const { name, include_type, transport } = args;
+    const source = this.resolveSource(args, `abap_set_class_include(${name})`);
     const objectUrl = buildObjectUrl(name, 'CLAS');
     const sourceUrl = buildClassIncludeUrl(name, include_type);
 
