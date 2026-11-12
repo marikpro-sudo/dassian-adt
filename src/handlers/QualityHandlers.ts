@@ -2,7 +2,8 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import { buildObjectUrl, buildSourceUrl, buildMethodUrl, NESTED_TYPES } from '../lib/urlBuilder.js';
-import { formatError } from '../lib/errors.js';
+import { formatError, parseAdtError } from '../lib/errors.js';
+import { isLegacyAtcResult, parseLegacyAtcResult, atcObjectUrlForNested } from '../lib/atcLegacy.js';
 import type { UsageReference } from 'abap-adt-api';
 
 export class QualityHandlers extends BaseHandler {
@@ -33,12 +34,16 @@ export class QualityHandlers extends BaseHandler {
           'Returns findings grouped by severity (error, warning, info). ' +
           'Clean core compliance issues appear here. ' +
           'The response includes worklistId and variantWarning — if variantWarning is set, SAP silently fell back to DEFAULT (variant name did not match SATC configuration). ' +
-          'Use abap_atc_variants to see what the system reports as its configured properties.',
+          'Use abap_atc_variants to see what the system reports as its configured properties. ' +
+          'On older releases (Basis 7.40) the variant lookup endpoint does not exist: the run is then sent directly with the variant name and the response carries mode="legacy". ' +
+          'For FUGR/FF (function module) the whole function group is checked — pass fugr if auto-discovery fails. ' +
+          'ATC checks the ACTIVE version: activate first.',
         inputSchema: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Object name' },
             type: { type: 'string', description: 'Object type' },
+            fugr: { type: 'string', description: 'Parent function group — for type FUGR/FF if auto-discovery fails' },
             variant: { type: 'string', description: 'ATC check variant name — must match exactly what is configured in SATC transaction (case-sensitive). Default: DEFAULT' }
           },
           required: ['name', 'type']
@@ -254,14 +259,31 @@ export class QualityHandlers extends BaseHandler {
       this.fail('abap_atc_run requires name (object name) and type (e.g. CLAS, PROG/P). ' +
         'To check a transport\'s objects, first list them with transport_contents, then run ATC per object.');
     }
-    const objectUrl = buildObjectUrl(args.name, args.type);
     const variant = args.variant || 'DEFAULT';
     try {
+      // ATC wants the function GROUP for function modules / group includes.
+      const upType = String(args.type).toUpperCase();
+      let objectUrl: string;
+      if (upType === 'FUGR/FF' || upType === 'FUGR/I') {
+        const nested = await this.resolveNestedUrl(args.name, upType, args.fugr);
+        objectUrl = atcObjectUrlForNested(nested.objectUrl);
+      } else {
+        objectUrl = buildObjectUrl(args.name, args.type);
+      }
+
       // Step 1: Resolve variant name to internal worklist ID.
       // SAP silently falls back to DEFAULT if the variant name doesn't exist in SATC.
-      const worklistId = await this.withSession(() =>
-        this.adtclient.atcCheckVariant(variant)
-      );
+      let worklistId: string;
+      try {
+        worklistId = await this.withSession(() =>
+          this.adtclient.atcCheckVariant(variant)
+        );
+      } catch (e: any) {
+        // Older releases (Basis 7.40): /atc/worklists?checkVariant= answers 404, but
+        // /atc/runs?worklistId=<variant> works and returns the verdicts inline.
+        if (!parseAdtError(e).isNotFound) throw e;
+        return await this.runLegacyAtc(args.name, variant, objectUrl);
+      }
 
       // Step 1b: Fallback detection — if a non-DEFAULT variant was requested,
       // probe DEFAULT and compare IDs. Same ID = SAP silently fell back.
@@ -344,6 +366,54 @@ export class QualityHandlers extends BaseHandler {
     } catch (error: any) {
       this.fail(formatError(`abap_atc_run(${args.name})`, error));
     }
+  }
+
+  /**
+   * ATC for releases without the variant-lookup endpoint (see lib/atcLegacy.ts):
+   * post the run directly and read the verdicts from the response body.
+   */
+  private async runLegacyAtc(name: string, variant: string, objectUrl: string): Promise<any> {
+    await this.notify(`Running ATC on ${name} (variant: ${variant}, legacy mode)…`);
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<atc:run maximumVerdicts="200" xmlns:atc="http://www.sap.com/adt/atc">` +
+      `<objectSets xmlns:adtcore="http://www.sap.com/adt/core"><objectSet kind="inclusive">` +
+      `<adtcore:objectReferences><adtcore:objectReference adtcore:uri="${objectUrl}"/></adtcore:objectReferences>` +
+      `</objectSet></objectSets></atc:run>`;
+    const response: any = await this.withSession(() => {
+      const h = (this.adtclient as any).h;
+      return h.request(`/sap/bc/adt/atc/runs?worklistId=${encodeURIComponent(variant)}`, {
+        method: 'POST',
+        headers: { Accept: 'application/xml', 'Content-Type': 'application/xml' },
+        body
+      });
+    });
+    const xml = String(response?.body ?? response?.data ?? '');
+    if (!isLegacyAtcResult(xml)) {
+      this.fail(
+        `abap_atc_run(${name}): variant lookup returned 404 and the direct run did not return verdicts. ` +
+        `Response starts with: ${xml.slice(0, 200) || '(empty)'}`
+      );
+    }
+    const parsed = parseLegacyAtcResult(xml);
+    const grouped: { error: any[]; warning: any[]; info: any[] } = { error: [], warning: [], info: [] };
+    for (const f of parsed.findings) {
+      if (f.priority === 1) grouped.error.push(f);
+      else if (f.priority === 2) grouped.warning.push(f);
+      else grouped.info.push(f);
+    }
+    return this.success({
+      name,
+      mode: 'legacy',
+      variant,
+      variantNote: 'Variant lookup is not available on this release; the variant name was passed to the run as-is and could not be verified.',
+      checkedObjectUrl: objectUrl,
+      runId: parsed.runId,
+      summary: { error: grouped.error.length, warning: grouped.warning.length, info: grouped.info.length },
+      findings: grouped,
+      totalFindings: parsed.findings.length,
+      truncated: parsed.findings.length >= 200
+    });
   }
 
   private async handleAtcVariants(args: any): Promise<any> {
