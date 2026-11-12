@@ -7,3 +7,7 @@ TEST_RESULTS*.md
 sap-systems.json
 *.zip
 docs/brainstorming
+.env.*
+test_lock.js
+test_step.js
+test_write.js
