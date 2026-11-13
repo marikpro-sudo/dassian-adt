@@ -4,6 +4,7 @@ import { session_types } from 'abap-adt-api';
 import type { ToolDefinition } from '../types/tools.js';
 import { formatError } from '../lib/errors.js';
 import { parseDumpFeed, filterDumps, clip } from '../lib/dumpFeed.js';
+import { isFlatInactiveList, parseFlatInactiveList } from '../lib/inactiveLegacy.js';
 
 export class SystemHandlers extends BaseHandler {
   getTools(): ToolDefinition[] {
@@ -52,7 +53,9 @@ export class SystemHandlers extends BaseHandler {
         description:
           'List all objects with inactive versions (objects that have been modified but not yet activated). ' +
           'Returns each inactive object with its type, name, and user. ' +
-          'Use before abap_activate to see what needs to be activated.',
+          'Use before abap_activate to see what needs to be activated. ' +
+          'On older releases (SAP_BASIS 7.40) the list comes in a flat format without user or transport: ' +
+          'the response then carries mode="legacy" and each object has name, type, uri and package.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
@@ -191,7 +194,21 @@ export class SystemHandlers extends BaseHandler {
   private async handleInactiveObjects(): Promise<any> {
     try {
       const records = await this.withSession(() => this.adtclient.inactiveObjects());
-      return this.success({ count: (records as any[]).length, objects: records });
+      if ((records as any[]).length > 0) {
+        return this.success({ count: (records as any[]).length, objects: records });
+      }
+      // The library found nothing. On SAP_BASIS 7.40 that is also what a NON-empty answer looks like:
+      // the release sends a flat adtcore:objectReferences list the library does not read (lib/inactiveLegacy.ts).
+      const h = (this.adtclient as any).h;
+      const response: any = await this.withSession(() =>
+        h.request('/sap/bc/adt/activation/inactiveobjects', { method: 'GET', headers: { Accept: '*/*' } })
+      );
+      const xml = String(response?.body ?? response?.data ?? '');
+      if (!isFlatInactiveList(xml)) {
+        return this.success({ count: 0, objects: [] });
+      }
+      const objects = parseFlatInactiveList(xml);
+      return this.success({ count: objects.length, mode: 'legacy', objects });
     } catch (error: any) {
       this.fail(formatError('abap_inactive_objects', error));
     }
