@@ -4,6 +4,10 @@ import type { ToolDefinition } from '../types/tools.js';
 import { buildObjectUrl, buildSourceUrl, buildMethodUrl, NESTED_TYPES } from '../lib/urlBuilder.js';
 import { formatError, parseAdtError } from '../lib/errors.js';
 import { isLegacyAtcResult, parseLegacyAtcResult, atcObjectUrlForNested } from '../lib/atcLegacy.js';
+import {
+  RIS_BASE, DEFAULT_USED_IN, DDIC_USED_IN, DDIC_PAYLOAD, buildRisRequest, parseRisMapping,
+  parseRisResults, parseRisCodeLines, realUsages, type RisObject, type LegacyUsage
+} from '../lib/whereUsedLegacy.js';
 import type { UsageReference } from 'abap-adt-api';
 
 export class QualityHandlers extends BaseHandler {
@@ -73,7 +77,11 @@ export class QualityHandlers extends BaseHandler {
           'Equivalent to Ctrl+Shift+G in Eclipse ADT or SE12 where-used in SAP GUI. ' +
           'Use this before deleting or modifying objects to understand the impact. ' +
           'For class methods use type CLAS/OM with name="CLASS_NAME::METHOD_NAME" (e.g. "/DSN/MY_CLASS::GET_CONT") ' +
-          'or pass name=class and method=method_name separately.',
+          'or pass name=class and method=method_name separately. ' +
+          'On older releases (SAP_BASIS 7.40) the modern where-used resource does not exist: the older where-used service is used instead ' +
+          '(response carries mode="legacy"). There usages are searched in programs, classes, interfaces and function modules ' +
+          '(plus dictionary objects for TABL/STRU/DTEL/DOMA/TTYP/VIEW), each reference has uri and line where SAP reports one, ' +
+          'and snippets=true adds the source lines for up to 20 references. FUGR/FF takes an optional fugr.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -82,7 +90,9 @@ export class QualityHandlers extends BaseHandler {
             method: { type: 'string', description: 'Method name when type=CLAS/OM (alternative to CLASS::METHOD syntax in name)' },
             line: { type: 'number', description: 'Optional: line number to find references to a specific symbol at that position' },
             column: { type: 'number', description: 'Optional: column number (used with line) for symbol-level where-used' },
-            snippets: { type: 'boolean', description: 'If true, also fetch code snippets showing exactly how the object is used at each location (default: false)' }
+            snippets: { type: 'boolean', description: 'If true, also fetch code snippets showing exactly how the object is used at each location (default: false)' },
+            fugr: { type: 'string', description: 'Parent function group — for type FUGR/FF if auto-discovery fails' },
+            max_results: { type: 'number', description: 'Legacy mode only: maximum references returned (default 200)' }
           },
           required: ['name', 'type']
         }
@@ -209,6 +219,10 @@ export class QualityHandlers extends BaseHandler {
         references = await this.withSession(() =>
           this.adtclient.usageReferences(objectUrl, args.line, args.column)
         );
+      } catch (e: any) {
+        // SAP_BASIS 7.40: no usageReferences resource — fall back to the older where-used service.
+        if (!parseAdtError(e).isNotFound) throw e;
+        return await this.whereUsedLegacy(args);
       } finally {
         if (axiosInst && interceptorId !== undefined) {
           axiosInst.interceptors.response.eject(interceptorId);
@@ -366,6 +380,116 @@ export class QualityHandlers extends BaseHandler {
     } catch (error: any) {
       this.fail(formatError(`abap_atc_run(${args.name})`, error));
     }
+  }
+
+  /** Where-used through the older RIS service (see lib/whereUsedLegacy.ts). */
+  private async whereUsedLegacy(args: any): Promise<any> {
+    const h = (this.adtclient as any).h;
+    const post = (path: string, qs: Record<string, string>, body: string, contentType: string): Promise<any> =>
+      this.withSession(() =>
+        h.request(RIS_BASE + path, {
+          method: 'POST', qs,
+          headers: { 'Content-Type': contentType, Accept: 'application/xml' },
+          body
+        })
+      );
+    const bodyOf = (r: any): string => String(r?.body ?? r?.data ?? '');
+
+    // 1. What are we looking for?
+    const upType = String(args.type).toUpperCase();
+    let target: RisObject;
+    if (upType === 'CLAS/OM') {
+      const [cls, meth] = args.method ? [args.name, args.method] : String(args.name).split('::');
+      target = { trobjtype: 'CLAS', subtype: '', legacyType: 'OM', objectName: String(meth).toUpperCase(), enclObjectName: String(cls).toUpperCase(), fullName: '' };
+    } else if (DDIC_PAYLOAD[upType]) {
+      const [tro, legacy] = DDIC_PAYLOAD[upType];
+      target = { trobjtype: tro, subtype: '', legacyType: legacy, objectName: String(args.name).toUpperCase(), enclObjectName: '', fullName: '' };
+    } else {
+      let objectUrl: string;
+      let sourceUrl: string;
+      if (NESTED_TYPES.has(upType)) {
+        ({ objectUrl, sourceUrl } = await this.resolveNestedUrl(args.name, upType, args.fugr));
+      } else {
+        objectUrl = buildObjectUrl(args.name, args.type);
+        sourceUrl = buildSourceUrl(args.name, args.type);
+      }
+      let uri = objectUrl;
+      let body = 'x';
+      if (args.line) {
+        // Symbol at a cursor position: SAP resolves it from the source we send along.
+        body = await this.withSession(() => this.adtclient.getObjectSource(sourceUrl));
+        uri = `${sourceUrl}#start=${args.line},${args.column ?? 0}`;
+      }
+      const mapped = parseRisMapping(bodyOf(
+        await post('fullnamemapping', { RIS_REQUEST_TYPE: 'MAP_URI_TO_RIS_REQUEST', uri }, body, 'text/plain')
+      ));
+      if (!mapped) {
+        this.fail(`abap_where_used(${args.name}): SAP could not resolve ${uri} to a repository object. ` +
+          'Check name and type; for a symbol check line/column (1-based line, column of the symbol start).');
+      }
+      target = mapped!;
+    }
+
+    // 2. One search per kind of using object.
+    const kinds = DDIC_PAYLOAD[`${target.trobjtype}/${target.legacyType}`]
+      ? [...DEFAULT_USED_IN, ...DDIC_USED_IN]
+      : DEFAULT_USED_IN;
+    await this.notify(`Where-used for ${target.enclObjectName ? target.enclObjectName + '=>' : ''}${target.objectName} (legacy service)…`);
+    const all: LegacyUsage[] = [];
+    const skipped: string[] = [];
+    for (const kind of kinds) {
+      try {
+        const xml = bodyOf(await post('whereused', { RIS_REQUEST_TYPE: 'WHERE_USED_LAZY' }, buildRisRequest(kind, target), 'application/xml'));
+        all.push(...parseRisResults(xml));
+      } catch (e: any) {
+        skipped.push(`${kind.join('/')}: ${String(e?.message || e).slice(0, 120)}`);
+      }
+    }
+    if (skipped.length === kinds.length) {
+      this.fail(`abap_where_used(${args.name}): every search failed — ${skipped.join('; ')}`);
+    }
+
+    const usages = realUsages(all);
+    const max = Number(args.max_results) > 0 ? Number(args.max_results) : 200;
+    const shown = usages.slice(0, max);
+
+    // 3. Optional source lines.
+    const SNIPPET_LIMIT = 20;
+    const snippetsFor = new Map<LegacyUsage, any[]>();
+    if (args.snippets) {
+      for (const u of shown.slice(0, SNIPPET_LIMIT)) {
+        try {
+          const xml = bodyOf(await post('whereused', { RIS_REQUEST_TYPE: 'CODE_LINES' }, `<?xml version="1.0" encoding="utf-8"?>${u.raw}`, 'application/xml'));
+          snippetsFor.set(u, parseRisCodeLines(xml).map(l => ({ line: l.line, column: l.columnStart, source: l.source })));
+        } catch (_) { /* snippets are best effort */ }
+      }
+    }
+
+    return this.success({
+      name: args.name,
+      type: args.type,
+      mode: 'legacy',
+      searchedFor: {
+        type: `${target.trobjtype}/${target.legacyType}`,
+        name: target.objectName,
+        ...(target.enclObjectName ? { parent: target.enclObjectName } : {})
+      },
+      searchedIn: kinds.map(k => k.join('/')),
+      ...(skipped.length ? { skipped } : {}),
+      referenceCount: usages.length,
+      ...(usages.length > shown.length ? { truncated: true, returned: shown.length } : {}),
+      references: shown.map(u => ({
+        name: u.name,
+        type: u.type,
+        ...(u.parent ? { parent: u.parent } : {}),
+        ...(u.description && u.description !== u.name ? { description: u.description } : {}),
+        uri: u.uri,
+        ...(u.line ? { line: u.line } : {}),
+        ...(u.include && u.include !== u.name ? { include: u.include } : {}),
+        ...(snippetsFor.has(u) ? { snippets: snippetsFor.get(u) } : {})
+      })),
+      ...(args.snippets && shown.length > SNIPPET_LIMIT ? { snippetNote: `Snippets fetched for the first ${SNIPPET_LIMIT} references only.` } : {})
+    });
   }
 
   /**

@@ -3,6 +3,7 @@ import { BaseHandler } from './BaseHandler.js';
 import { session_types } from 'abap-adt-api';
 import type { ToolDefinition } from '../types/tools.js';
 import { formatError } from '../lib/errors.js';
+import { parseDumpFeed, filterDumps, clip } from '../lib/dumpFeed.js';
 
 export class SystemHandlers extends BaseHandler {
   getTools(): ToolDefinition[] {
@@ -29,14 +30,19 @@ export class SystemHandlers extends BaseHandler {
           'Retrieve recent ABAP short dumps (ST22). ' +
           'Returns dump list with error text, program, and timestamp. ' +
           'Use after a failed abap_run or to investigate customer-reported short dumps. ' +
-          'Optionally filter by a search query (e.g. program name or error class).',
+          'Optionally filter by a search query (e.g. program name or error class). ' +
+          'Each dump has time, user, runtime error, program, title, where it terminated (uri + line) and the error analysis; ' +
+          'detail=true adds the termination text, source extract and call stack. ' +
+          'The feed only holds recent dumps (about the last day on older releases).',
         inputSchema: {
           type: 'object',
           properties: {
             query: {
               type: 'string',
-              description: 'Optional filter — program name, error class, or free text. Omit to get all recent dumps.'
-            }
+              description: 'Optional filter — program name, error class, user or free text (matched in this server, case-insensitive). Omit to get all recent dumps.'
+            },
+            max: { type: 'number', description: 'Maximum dumps returned, newest first (default 10, at most 50)' },
+            detail: { type: 'boolean', description: 'If true, include termination text, source extract and call stack for every dump (default false)' }
           }
         }
       },
@@ -141,49 +147,42 @@ export class SystemHandlers extends BaseHandler {
 
   private async handleGetDump(args: any): Promise<any> {
     try {
-      // Call the dumps endpoint directly — the library's parseDumps() destructures
-      // summary.#text unconditionally and throws on dumps with empty/missing summaries.
+      // The feed is read raw and parsed in lib/dumpFeed.ts: the library's parseDumps() throws on
+      // dumps without a summary, fast-xml-parser hits its entity expansion limit on the escaped HTML,
+      // and older releases reject the free-text $query parameter — so the filter is applied here.
       const h = (this.adtclient as any).h;
-      const qs: Record<string, string> = {};
-      if (args.query) qs['$query'] = args.query;
+      const max = Math.min(Number(args.max) > 0 ? Number(args.max) : 10, 50);
       const response = await this.withSession(() =>
         h.request('/sap/bc/adt/runtime/dumps', {
-          method: 'GET', qs,
+          method: 'GET',
+          qs: { '$top': String(args.query ? 100 : max) },
           headers: { Accept: 'application/atom+xml;type=feed' }
         })
       );
+      const all = parseDumpFeed(String((response as any)?.body ?? (response as any)?.data ?? ''));
+      const matched = filterDumps(all, args.query);
+      const dumps = matched.slice(0, max).map(d => ({
+        id: d.id,
+        time: d.time,
+        user: d.user,
+        runtimeError: d.runtimeError,
+        program: d.program,
+        title: d.title,
+        ...(d.terminatedAt ? { terminatedAt: d.terminatedAt } : {}),
+        errorAnalysis: clip(d.errorAnalysis, args.detail ? 4000 : 1200),
+        ...(args.detail ? {
+          termination: clip(d.termination, 2000),
+          sourceExtract: clip(d.sourceExtract, 4000),
+          stack: clip(d.stack, 4000)
+        } : {})
+      }));
 
-      // Parse defensively — fast-xml-parser is already a dep of abap-adt-api
-      const { XMLParser } = await import('fast-xml-parser');
-      const parser = new XMLParser({
-        ignoreAttributes: false,
-        attributeNamePrefix: '@_',
-        removeNSPrefix: true,
-        isArray: (name) => name === 'entry' || name === 'category' || name === 'link'
+      return this.success({
+        count: dumps.length,
+        ...(matched.length > dumps.length ? { truncated: true, matched: matched.length } : {}),
+        ...(args.query ? { query: args.query, scanned: all.length } : {}),
+        dumps
       });
-      const raw = parser.parse((response as any).body || '');
-      const entries: any[] = raw?.feed?.entry || [];
-
-      const dumps = entries.map((e: any) => {
-        const id = e.id || '';
-        const author = e.author?.name || '';
-        // summary may be a string, an object with #text, or missing
-        const sumNode = e.summary;
-        const text = typeof sumNode === 'string'
-          ? sumNode
-          : (sumNode?.['#text'] || sumNode?.['#cdata-section'] || '');
-        const type = sumNode?.['@_type'] || '';
-        const categories = (e.category || []).map((c: any) =>
-          c['@_label'] || c['@_term'] || ''
-        );
-        const links = (e.link || []).map((l: any) => ({
-          href: l['@_href'] || l['@_rel'] || '',
-          rel: l['@_rel'] || ''
-        }));
-        return { id, author, text, type, categories, links };
-      });
-
-      return this.success({ count: dumps.length, dumps });
     } catch (error: any) {
       this.fail(`abap_get_dump failed: ${error.message || 'Unknown error'}`);
     }
