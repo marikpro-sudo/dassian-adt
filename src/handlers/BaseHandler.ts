@@ -326,6 +326,12 @@ export abstract class BaseHandler {
     if (type.toUpperCase() === 'FUGR/FF') {
       return this.resolveFunctionModuleUrl(name, fugr);
     }
+    // Local patch 2026-11-14: FUGR/I with fugr -> build the include URL directly.
+    // On SAP_BASIS 7.40 the typed quickSearch for FUGR/I returns nothing.
+    if (type.toUpperCase() === 'FUGR/I' && fugr) {
+      const objectUrl = `/sap/bc/adt/functions/groups/${encodeAbapName(fugr)}/includes/${encodeAbapName(name)}`;
+      return { objectUrl, sourceUrl: `${objectUrl}/source/main` };
+    }
 
     const results = await this.withSession(() =>
       this.adtclient.searchObject(name.toUpperCase(), type.toUpperCase(), 5)
