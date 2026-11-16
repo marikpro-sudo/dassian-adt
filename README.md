@@ -10,6 +10,36 @@ Based on [mcp-abap-abap-adt-api](https://github.com/mario-andreschak/mcp-abap-ab
 
 Dassian's fork adds input validation, error intelligence, MCP elicitation, session recovery, and a test suite. See [CHANGES.md](CHANGES.md) for the full list.
 
+## This fork: patches for SAP_BASIS 7.40
+
+This fork ([marikpro-sudo/dassian-adt](https://github.com/marikpro-sudo/dassian-adt), branch `local-patches`) keeps the server usable on SAP ERP with SAP_BASIS 7.40. Several ADT endpoints that upstream relies on do not exist on that release, so the tools below failed or returned nothing. `main` tracks upstream unchanged; the patches live in `local-patches`.
+
+| Tool | What the patch does |
+|------|---------------------|
+| `abap_set_source`, `abap_set_class_include` | New `sourceFile` parameter: the server reads the source from a local file on its own machine, so a large source is not sent inline in the tool call. `sourceFile` wins when both `source` and `sourceFile` are given. |
+| `abap_atc_run` | Works on releases without the ATC variant-lookup endpoint: the run is posted directly and the reply carries a summary and the findings. For a function module the whole function group is checked. |
+| `abap_where_used` | Where-used on 7.40 for classes, interfaces, programs, function modules, methods and DDIC objects, with optional code snippets. |
+| `abap_get_dump` | Reads the ST22 dump feed on 7.40: time, user, error, program and the place of the failure. |
+| `abap_inactive_objects` | Reads the flat list that 7.40 returns instead of the newer structure. |
+| `abap_get_source`, `abap_set_source` with `FUGR/I` | The include URL is built directly when `fugr` is given, because the type search for `FUGR/I` is empty on 7.40. |
+
+Replies of `abap_atc_run`, `abap_where_used` and `abap_inactive_objects` that took a 7.40 path are marked `mode: "legacy"`. Each patch has unit tests under `src/__tests__/unit/` (`atcLegacy`, `whereUsedLegacy`, `dumpFeed`, `inactiveLegacy`).
+
+Observed on our 7.40 system and **not** fixed here:
+
+- Writing source needs stateful ADT sessions, which releases below 7.51 do not provide. We solved it on the SAP side with a small enhancement; it is not part of this repository.
+- `abap_run` does not work: `IF_OO_ADT_CLASSRUN` does not exist on 7.40. We run code through an ABAP Unit test class instead.
+- `abap_query`, `abap_table`, `abap_get_function_group`, `transport_create`, `transport_list`, `transport_info`, `transport_contents` and DDIC object creation return errors or a false success.
+
+Install from this branch:
+
+```bash
+git clone -b local-patches https://github.com/marikpro-sudo/dassian-adt.git
+cd dassian-adt
+npm ci
+npm run build
+```
+
 ## What It Does
 
 25 tools covering the full ABAP development lifecycle:
