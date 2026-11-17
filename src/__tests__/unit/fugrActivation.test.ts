@@ -1,4 +1,9 @@
-import { buildFunctionGroupActivationRefs, inactiveInFunctionGroup } from '../../lib/fugrActivation';
+import {
+  buildFunctionGroupActivationRefs,
+  inactiveInFunctionGroup,
+  isFunctionGroupType,
+  resolveFunctionGroupTarget
+} from '../../lib/fugrActivation';
 
 const GROUP_URL = '/sap/bc/adt/functions/groups/zdemo_fg';
 
@@ -44,6 +49,29 @@ describe('fugrActivation', () => {
       { uri: '/sap/bc/adt/functions/groups/zdemo_fg/fmodules/z_demo_fm', name: 'Z_DEMO_FM' }
     ]);
     expect(buildFunctionGroupActivationRefs(GROUP_URL, 'ZDEMO_FG', [])).toEqual([{ uri: GROUP_URL, name: 'ZDEMO_FG' }]);
+  });
+
+  it('recognises the types that are activated through their group', () => {
+    expect(['FUGR', 'fugr/f', 'FUGR/FF', 'FUGR/I'].map(isFunctionGroupType)).toEqual([true, true, true, true]);
+    expect(['CLAS', 'PROG/I', 'PROG/P', ''].map(isFunctionGroupType)).toEqual([false, false, false, false]);
+  });
+
+  it('resolves a group, a function module and an include to the group and the requested object', () => {
+    expect(resolveFunctionGroupTarget('ZDEMO_FG', 'FUGR')).toEqual({ group: 'ZDEMO_FG', groupUrl: GROUP_URL, requested: undefined });
+    expect(resolveFunctionGroupTarget('z_demo_fm', 'FUGR/FF', 'ZDEMO_FG')).toEqual({
+      group: 'ZDEMO_FG',
+      groupUrl: GROUP_URL,
+      requested: { uri: '/sap/bc/adt/functions/groups/zdemo_fg/fmodules/z_demo_fm', name: 'Z_DEMO_FM' }
+    });
+    expect(resolveFunctionGroupTarget('LZDEMO_FGF01', 'fugr/i', 'zdemo_fg').requested).toEqual({
+      uri: '/sap/bc/adt/functions/groups/zdemo_fg/includes/lzdemo_fgf01',
+      name: 'LZDEMO_FGF01'
+    });
+  });
+
+  it('refuses a function module or include without its group', () => {
+    expect(() => resolveFunctionGroupTarget('Z_DEMO_FM', 'FUGR/FF')).toThrow(/requires the fugr parameter/);
+    expect(() => resolveFunctionGroupTarget('LZDEMO_FGF01', 'FUGR/I')).toThrow(/requires the fugr parameter/);
   });
 
   it('matches namespaced groups regardless of URL encoding and case', () => {

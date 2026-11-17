@@ -11,10 +11,47 @@
  */
 
 import type { InactiveObjectRef } from './inactiveLegacy.js';
+import { buildObjectUrl, buildFunctionModuleUrl, buildFunctionIncludeUrl } from './urlBuilder.js';
 
 export interface ActivationRef {
   uri: string;
   name: string;
+}
+
+export interface FunctionGroupTarget {
+  /** Function group name as given by the caller. */
+  group: string;
+  groupUrl: string;
+  /** The function module or include the caller asked for; undefined when the group itself was named. */
+  requested?: ActivationRef;
+}
+
+/** FUGR, FUGR/F, FUGR/FF and FUGR/I — the types that are activated through their function group. */
+export function isFunctionGroupType(type: string): boolean {
+  const t = String(type || '').toUpperCase();
+  return t === 'FUGR' || t === 'FUGR/F' || t === 'FUGR/FF' || t === 'FUGR/I';
+}
+
+/**
+ * Resolve name/type/fugr of an activation request to the function group and the requested object.
+ * Throws when a function module or include is given without its function group.
+ */
+export function resolveFunctionGroupTarget(name: string, type: string, fugr?: string): FunctionGroupTarget {
+  const t = String(type || '').toUpperCase();
+  const nested = t === 'FUGR/FF' || t === 'FUGR/I';
+  if (nested && !fugr) {
+    throw new Error(
+      `type ${t} requires the fugr parameter (parent function group name). ` +
+      `Example: fugr="/DSN/010BWE" to activate function group /DSN/010BWE.`
+    );
+  }
+  const group = String(nested ? fugr : name);
+  const groupUrl = buildObjectUrl(group, 'FUGR/F');
+  const requested: ActivationRef | undefined =
+    t === 'FUGR/FF' ? { uri: buildFunctionModuleUrl(group, name), name: String(name).toUpperCase() } :
+    t === 'FUGR/I'  ? { uri: buildFunctionIncludeUrl(group, name), name: String(name).toUpperCase() } :
+    undefined;
+  return { group, groupUrl, requested };
 }
 
 function normalizeUri(uri: string): string {

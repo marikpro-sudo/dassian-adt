@@ -2,10 +2,17 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import type { InactiveObject } from 'abap-adt-api';
-import { buildObjectUrl, buildPackageUrl, buildFunctionModuleUrl, buildFunctionIncludeUrl, getSupportedTypes } from '../lib/urlBuilder.js';
+import { buildObjectUrl, buildPackageUrl, getSupportedTypes } from '../lib/urlBuilder.js';
 import { formatError, parseAdtError, formatActivationMessages } from '../lib/errors.js';
 import { isFlatInactiveList, parseFlatInactiveList, type InactiveObjectRef } from '../lib/inactiveLegacy.js';
-import { buildFunctionGroupActivationRefs, inactiveInFunctionGroup, type ActivationRef } from '../lib/fugrActivation.js';
+import {
+  buildFunctionGroupActivationRefs,
+  inactiveInFunctionGroup,
+  isFunctionGroupType,
+  resolveFunctionGroupTarget,
+  type ActivationRef,
+  type FunctionGroupTarget
+} from '../lib/fugrActivation.js';
 
 const SUPPORTED = getSupportedTypes().join(', ');
 
@@ -18,6 +25,8 @@ export class ObjectHandlers extends BaseHandler {
           'Create a new ABAP object. For temporary objects use package=$TMP — no transport needed. ' +
           'For permanent objects, provide both a named package and transport. ' +
           'After creation, write source with abap_set_source and activate with abap_activate. ' +
+          'For a function module (FUGR/FF) or a function group include (FUGR/I) give fugr (the existing function group) ' +
+          'instead of a package; add transport when the group is outside $TMP. ' +
           'BDEF (behavior definition) is supported — activation order is DDLS → BDEF → behavior pool class.',
         inputSchema: {
           type: 'object',
@@ -25,8 +34,9 @@ export class ObjectHandlers extends BaseHandler {
             name: { type: 'string', description: 'Object name, e.g. ZCL_MY_CLASS or /DSN/MY_CLASS' },
             type: {
               type: 'string',
-              description: `Object type. Common: CLAS/OC (class), PROG/P (program), PROG/I (include), FUGR/F (function group), DDLS/DF (CDS view), INTF/OI (interface), TABL/DT (table). Full list: ${SUPPORTED}`
+              description: `Object type. Common: CLAS/OC (class), PROG/P (program), PROG/I (include), FUGR/F (function group), FUGR/FF (function module, needs fugr), FUGR/I (function group include, needs fugr), DDLS/DF (CDS view), INTF/OI (interface), TABL/DT (table). Full list: ${SUPPORTED}`
             },
+            fugr: { type: 'string', description: 'For type=FUGR/FF or FUGR/I: the existing function group to create the object in, e.g. /DSN/010BWE.' },
             package: { type: 'string', description: 'Package name, e.g. $TMP or /DSN/CORE. Also accepted as "devclass".' },
             devclass: { type: 'string', description: 'Alias for package.' },
             description: { type: 'string', description: 'Short description shown in ABAP Workbench' },
@@ -100,18 +110,21 @@ export class ObjectHandlers extends BaseHandler {
           'Activate multiple ABAP objects in a single ADT request. ' +
           'More efficient than calling abap_activate repeatedly for each object. ' +
           'Returns activated:true if all objects activated cleanly, or activated:false with error messages if any failed. ' +
-          'Use this after writing source for several objects at once (e.g. after a set of transport_assign calls).',
+          'Use this after writing source for several objects at once (e.g. after a set of transport_assign calls). ' +
+          'Function groups (FUGR), function modules (FUGR/FF) and function group includes (FUGR/I) are expanded to the group ' +
+          'plus everything inactive in it, and checked against the inactive-objects list afterwards; give "fugr" for FUGR/FF and FUGR/I.',
         inputSchema: {
           type: 'object',
           properties: {
             objects: {
               type: 'array',
-              description: 'List of objects to activate. Each item must be an object with "name" (e.g. /DSN/MY_CLASS) and "type" (e.g. CLAS, PROG/P, DDLS).',
+              description: 'List of objects to activate. Each item must be an object with "name" (e.g. /DSN/MY_CLASS) and "type" (e.g. CLAS, PROG/P, DDLS). For FUGR/FF and FUGR/I add "fugr" (parent function group).',
               items: {
                 type: 'object',
                 properties: {
                   name: { type: 'string', description: 'ABAP object name' },
-                  type: { type: 'string', description: 'ABAP object type, e.g. CLAS or PROG/P' }
+                  type: { type: 'string', description: 'ABAP object type, e.g. CLAS or PROG/P' },
+                  fugr: { type: 'string', description: 'Parent function group name. Required when type is FUGR/FF or FUGR/I.' }
                 },
                 required: ['name', 'type']
               }
@@ -162,7 +175,52 @@ export class ObjectHandlers extends BaseHandler {
     'VIEW': 'VIEW/DV',
   };
 
+  /**
+   * Create a function module (FUGR/FF) or a function group include (FUGR/I) inside an existing function group.
+   *
+   * The request goes through the stateless clone of the client. On SAP_BASIS 7.40 creating an include in the
+   * stateful session leaves an enqueue on the function group name (TRDIR <group>) that nothing but the end of
+   * that session releases; in a stateless request the lock goes away with the request.
+   */
+  private async handleCreateInFunctionGroup(args: any, nestedType: 'FUGR/FF' | 'FUGR/I'): Promise<any> {
+    if (!args.fugr) {
+      this.fail(
+        `abap_create: type ${nestedType} requires the fugr parameter (the function group to create it in). ` +
+        `Example: fugr="/DSN/010BWE". The package comes from the function group.`
+      );
+    }
+    const group = String(args.fugr).toUpperCase();
+    const name = String(args.name).toUpperCase();
+    try {
+      await this.adtclient.statelessClone.createObject(
+        nestedType,
+        name,
+        group,
+        args.description,
+        buildObjectUrl(group, 'FUGR/F'),
+        undefined,
+        args.transport
+      );
+      return this.success({
+        message:
+          `Created ${nestedType} ${name} in function group ${group}. ` +
+          `Now write source with abap_set_source (type=${nestedType}, fugr=${group}) and activate with abap_activate.`,
+        name,
+        type: nestedType,
+        fugr: group
+      });
+    } catch (error: any) {
+      this.fail(formatError(`abap_create(${args.name})`, error));
+    }
+  }
+
   private async handleCreate(args: any): Promise<any> {
+    // Local patch 2026-11-17: function modules and function group includes live in a function group, not in a package.
+    const nestedType = String(args.type || '').toUpperCase();
+    if (nestedType === 'FUGR/FF' || nestedType === 'FUGR/I') {
+      return this.handleCreateInFunctionGroup(args, nestedType);
+    }
+
     // Accept devclass as alias for package (common SAP terminology)
     if (args.devclass && !args.package) args.package = args.devclass;
     if (!args.package) {
@@ -622,7 +680,7 @@ out->write( 'OK' ).
     // Local patch 2026-11-17: function groups, function modules and function group includes go through
     // one request that lists everything inactive in the group (see lib/fugrActivation.ts).
     const upperType = String(args.type).toUpperCase();
-    if (upperType === 'FUGR' || upperType === 'FUGR/F' || upperType === 'FUGR/FF' || upperType === 'FUGR/I') {
+    if (isFunctionGroupType(upperType)) {
       return this.handleActivateFunctionGroup(args, upperType);
     }
 
@@ -762,19 +820,13 @@ out->write( 'OK' ).
    * afterwards the inactive-objects list is read again, so a 200 that activated nothing is not reported as success.
    */
   private async handleActivateFunctionGroup(args: any, upperType: string): Promise<any> {
-    const nested = upperType === 'FUGR/FF' || upperType === 'FUGR/I';
-    if (nested && !args.fugr) {
-      this.fail(
-        `abap_activate: type ${upperType} requires the fugr parameter (parent function group name). ` +
-        `Example: fugr="/DSN/010BWE" to activate function group /DSN/010BWE.`
-      );
+    let target: FunctionGroupTarget;
+    try {
+      target = resolveFunctionGroupTarget(args.name, upperType, args.fugr);
+    } catch (e: any) {
+      this.fail(`abap_activate: ${e.message}`);
     }
-    const group = String(nested ? args.fugr : args.name);
-    const groupUrl = buildObjectUrl(group, 'FUGR/F');
-    const requested: ActivationRef | undefined =
-      upperType === 'FUGR/FF' ? { uri: buildFunctionModuleUrl(group, args.name), name: String(args.name).toUpperCase() } :
-      upperType === 'FUGR/I'  ? { uri: buildFunctionIncludeUrl(group, args.name), name: String(args.name).toUpperCase() } :
-      undefined;
+    const { group, groupUrl, requested } = target!;
 
     try {
       await this.notify(`Activating function group ${group.toUpperCase()}…`);
@@ -835,12 +887,33 @@ out->write( 'OK' ).
     try {
       // Build activation payload. SAP's batch endpoint uses the same minimal format as single:
       // {uri, name} only — adding adtcore:type or adtcore:parentUri causes "Check of condition failed".
-      const objectRefs = args.objects.map((o: any) => {
-        if (!o.name || !o.type) {
+      // Local patch 2026-11-17: function groups, function modules and function group includes are expanded
+      // to the group plus everything inactive in it (lib/fugrActivation.ts) — on SAP_BASIS 7.40 a reference
+      // activates only the object it points to, and FUGR/FF / FUGR/I need their group to build the URL.
+      const collected: ActivationRef[] = [];
+      const fugrGroups = new Map<string, string>();
+      let inactiveBefore: InactiveObjectRef[] | undefined;
+      for (const o of args.objects) {
+        if (!o || !o.name || !o.type) {
           throw new Error(`Each object must have name and type. Got: ${JSON.stringify(o)}`);
         }
-        const uri = buildObjectUrl(o.name, o.type);
-        return { uri, name: o.name.toUpperCase() };
+        if (isFunctionGroupType(o.type)) {
+          const target = resolveFunctionGroupTarget(o.name, o.type, o.fugr);
+          if (!inactiveBefore) {
+            try { inactiveBefore = await this.listInactiveObjects(); } catch (_) { inactiveBefore = []; }
+          }
+          collected.push(...buildFunctionGroupActivationRefs(target.groupUrl, target.group, inactiveBefore, target.requested));
+          fugrGroups.set(target.groupUrl, target.group.toUpperCase());
+        } else {
+          collected.push({ uri: buildObjectUrl(o.name, o.type), name: o.name.toUpperCase() });
+        }
+      }
+      const seenUris = new Set<string>();
+      const objectRefs = collected.filter(r => {
+        const key = r.uri.toLowerCase();
+        if (seenUris.has(key)) return false;
+        seenUris.add(key);
+        return true;
       });
 
       await this.notify(`Activating ${objectRefs.length} object(s)…`);
@@ -919,6 +992,24 @@ out->write( 'OK' ).
         this.fail(`abap_activate_batch: activation failed.\n${errorText}`);
       }
 
+      // A 200 without messages does not prove activation on 7.40 — read the inactive list again for the groups.
+      if (fugrGroups.size > 0) {
+        const still: InactiveObjectRef[] = [];
+        try {
+          const now = await this.listInactiveObjects();
+          for (const groupUrl of fugrGroups.keys()) still.push(...inactiveInFunctionGroup(groupUrl, now));
+        } catch (_) { /* cannot verify — report the activation result as is */ }
+        if (still.length > 0) {
+          return this.success({
+            activated: false,
+            objectCount: objectRefs.length,
+            groups: [...fugrGroups.values()],
+            errors: 'The activation request returned no errors, but these function group objects are still inactive.',
+            stillInactive: still.map(o => ({ name: o.name, type: o.type, uri: o.uri }))
+          });
+        }
+      }
+
       const inactive = result?.inactive || [];
       const inactiveNames = inactive
         .map((i: any) => i.object?.['adtcore:name'])
@@ -960,6 +1051,7 @@ out->write( 'OK' ).
         activated: true,
         objectCount: objectRefs.length,
         objects: args.objects.map((o: any) => o.name),
+        ...(fugrGroups.size > 0 ? { groups: [...fugrGroups.values()], activatedObjects: objectRefs.map(r => r.name) } : {}),
         dependentsStillInactive: inactiveNames.length > 0 ? inactiveNames : []
       });
     } catch (error: any) {
