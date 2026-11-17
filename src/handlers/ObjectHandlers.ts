@@ -2,8 +2,10 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import type { InactiveObject } from 'abap-adt-api';
-import { buildObjectUrl, buildPackageUrl, getSupportedTypes } from '../lib/urlBuilder.js';
+import { buildObjectUrl, buildPackageUrl, buildFunctionModuleUrl, buildFunctionIncludeUrl, getSupportedTypes } from '../lib/urlBuilder.js';
 import { formatError, parseAdtError, formatActivationMessages } from '../lib/errors.js';
+import { isFlatInactiveList, parseFlatInactiveList, type InactiveObjectRef } from '../lib/inactiveLegacy.js';
+import { buildFunctionGroupActivationRefs, inactiveInFunctionGroup, type ActivationRef } from '../lib/fugrActivation.js';
 
 const SUPPORTED = getSupportedTypes().join(', ');
 
@@ -38,7 +40,8 @@ export class ObjectHandlers extends BaseHandler {
         name: 'abap_delete',
         annotations: { destructiveHint: true },
         description:
-          'Delete an ABAP object. Locks the object, deletes it, and the lock is released implicitly by the delete. ' +
+          'Delete an ABAP object. Locks the object, deletes it, then releases the lock ' +
+          '(older releases keep the lock on the name after the delete). ' +
           'For objects in a transport, provide the transport number.',
         inputSchema: {
           type: 'object',
@@ -58,13 +61,16 @@ export class ObjectHandlers extends BaseHandler {
           'Must be called after abap_set_source or abap_create. ' +
           'Returns success:true with empty messages if clean. ' +
           'Returns success:false with error messages if activation fails — read them, fix the source, and retry. ' +
-          'For FUGR/FF (function modules): activation always targets the parent function group — provide fugr param.',
+          'For function groups (FUGR), function modules (FUGR/FF) and function group includes (FUGR/I): ' +
+          'the group and everything inactive in it are activated in one request, and the result is checked ' +
+          'against the inactive-objects list — activated:false with stillInactive if something stayed inactive. ' +
+          'Provide the fugr param for FUGR/FF and FUGR/I.',
         inputSchema: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Object name' },
             type: { type: 'string', description: `Object type. ${SUPPORTED}` },
-            fugr: { type: 'string', description: 'Parent function group name. Required when type=FUGR/FF, e.g. /DSN/010BWE.' }
+            fugr: { type: 'string', description: 'Parent function group name. Required when type=FUGR/FF or FUGR/I, e.g. /DSN/010BWE.' }
           },
           required: ['name', 'type']
         }
@@ -581,6 +587,11 @@ out->write( 'OK' ).
         if (args.transport) qs.corrNr = args.transport;
         await h.request(objectUrl, { method: 'DELETE', qs });
       });
+      // Local patch 2026-11-17: on SAP_BASIS 7.40 the delete does NOT release the lock — the enqueue
+      // on the program name stays (even after logout) and blocks re-creating or deleting the same name
+      // with "User … is already editing …". Releasing it with the same handle clears it. On releases
+      // where the delete already released the lock this call fails harmlessly.
+      try { await this.adtclient.unLock(objectUrl, lockHandle!); } catch (_) {}
       lockHandle = null;
 
       return this.success({ message: `Deleted ${args.type} ${args.name}` });
@@ -608,24 +619,15 @@ out->write( 'OK' ).
     if (!args.name || !args.type) {
       this.fail('abap_activate requires name (object name) and type (e.g. CLAS, PROG/P).');
     }
-    // Function modules can't be activated individually — SAP activates the whole function group.
-    // When type is FUGR/FF, activate the parent FUGR instead.
-    let activateName: string;
-    let objectUrl: string;
-
-    if (args.type?.toUpperCase() === 'FUGR/FF') {
-      if (!args.fugr) {
-        this.fail(
-          `abap_activate: type FUGR/FF requires the fugr parameter (parent function group name). ` +
-          `Example: fugr="/DSN/010BWE" to activate function group /DSN/010BWE.`
-        );
-      }
-      activateName = args.fugr.toUpperCase();
-      objectUrl = buildObjectUrl(args.fugr, 'FUGR/F');
-    } else {
-      activateName = args.name.toUpperCase();
-      objectUrl = buildObjectUrl(args.name, args.type);
+    // Local patch 2026-11-17: function groups, function modules and function group includes go through
+    // one request that lists everything inactive in the group (see lib/fugrActivation.ts).
+    const upperType = String(args.type).toUpperCase();
+    if (upperType === 'FUGR' || upperType === 'FUGR/F' || upperType === 'FUGR/FF' || upperType === 'FUGR/I') {
+      return this.handleActivateFunctionGroup(args, upperType);
     }
+
+    const activateName: string = args.name.toUpperCase();
+    const objectUrl: string = buildObjectUrl(args.name, args.type);
 
     try {
       await this.notify(`Activating ${activateName}…`);
@@ -703,6 +705,113 @@ out->write( 'OK' ).
         activated: true,
         name: args.name,
         dependentsStillInactive: inactiveNames.length > 0 ? inactiveNames : []
+      });
+    } catch (error: any) {
+      this.fail(formatError(`abap_activate(${args.name})`, error));
+    }
+  }
+
+  /** Inactive objects of the current user, on releases with the ioc envelope and on 7.40 with the flat list. */
+  private async listInactiveObjects(): Promise<InactiveObjectRef[]> {
+    const records = (await this.withSession(() => this.adtclient.inactiveObjects())) as any[];
+    const fromLibrary = (records || [])
+      .map(r => r?.object)
+      .filter(Boolean)
+      .map((o: any) => ({ name: o['adtcore:name'], type: o['adtcore:type'], uri: o['adtcore:uri'] }))
+      .filter((o: InactiveObjectRef) => o.name && o.uri);
+    if (fromLibrary.length > 0) return fromLibrary;
+
+    const h = (this.adtclient as any).h;
+    const response: any = await this.withSession(() =>
+      h.request('/sap/bc/adt/activation/inactiveobjects', { method: 'GET', headers: { Accept: '*/*' } })
+    );
+    const xml = String(response?.body ?? response?.data ?? '');
+    return isFlatInactiveList(xml) ? parseFlatInactiveList(xml) : [];
+  }
+
+  /** Post one activation request for several references and read the checklist messages of the answer. */
+  private async postActivation(refs: ActivationRef[]): Promise<{ success: boolean; messages: any[] }> {
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+      refs.map(r => `<adtcore:objectReference adtcore:uri="${esc(r.uri)}" adtcore:name="${esc(r.name)}"/>`).join('') +
+      `</adtcore:objectReferences>`;
+    const h = (this.adtclient as any).h;
+    const rawResp: any = await this.withSession(() =>
+      h.request('/sap/bc/adt/activation', {
+        method: 'POST', body,
+        qs: { method: 'activate', preauditRequested: true }
+      })
+    );
+    const { XMLParser } = await import('fast-xml-parser');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSPrefix: true });
+    const parsed = parser.parse(String(rawResp?.body ?? rawResp?.data ?? ''));
+    const messages: any[] = [];
+    const chkl = parsed?.messages;
+    if (chkl) {
+      const arr = Array.isArray(chkl.msg) ? chkl.msg : (chkl.msg ? [chkl.msg] : []);
+      arr.forEach((m: any) => messages.push({ type: m['@_type'] || 'E', shortText: m?.shortText?.txt || 'Syntax error', objName: m['@_objName'] || '' }));
+    }
+    return { success: !messages.some((m: any) => /[EAX]/.test(m.type)), messages };
+  }
+
+  /**
+   * Activate a function group, a function module or a function group include.
+   * The request lists the group, the requested object and everything else inactive in the group;
+   * afterwards the inactive-objects list is read again, so a 200 that activated nothing is not reported as success.
+   */
+  private async handleActivateFunctionGroup(args: any, upperType: string): Promise<any> {
+    const nested = upperType === 'FUGR/FF' || upperType === 'FUGR/I';
+    if (nested && !args.fugr) {
+      this.fail(
+        `abap_activate: type ${upperType} requires the fugr parameter (parent function group name). ` +
+        `Example: fugr="/DSN/010BWE" to activate function group /DSN/010BWE.`
+      );
+    }
+    const group = String(nested ? args.fugr : args.name);
+    const groupUrl = buildObjectUrl(group, 'FUGR/F');
+    const requested: ActivationRef | undefined =
+      upperType === 'FUGR/FF' ? { uri: buildFunctionModuleUrl(group, args.name), name: String(args.name).toUpperCase() } :
+      upperType === 'FUGR/I'  ? { uri: buildFunctionIncludeUrl(group, args.name), name: String(args.name).toUpperCase() } :
+      undefined;
+
+    try {
+      await this.notify(`Activating function group ${group.toUpperCase()}…`);
+      let before: InactiveObjectRef[] = [];
+      try { before = await this.listInactiveObjects(); } catch (_) { /* activate what was asked for */ }
+      const refs = buildFunctionGroupActivationRefs(groupUrl, group, before, requested);
+
+      const result = await this.postActivation(refs);
+      if (!result.success) {
+        return this.success({
+          activated: false,
+          name: args.name,
+          group: group.toUpperCase(),
+          errors: formatActivationMessages(result.messages)
+        });
+      }
+
+      let still: InactiveObjectRef[] = [];
+      let verified = true;
+      try { still = inactiveInFunctionGroup(groupUrl, await this.listInactiveObjects()); } catch (_) { verified = false; }
+      if (still.length > 0) {
+        return this.success({
+          activated: false,
+          name: args.name,
+          group: group.toUpperCase(),
+          errors: 'The activation request returned no errors, but these objects of the group are still inactive.',
+          stillInactive: still.map(o => ({ name: o.name, type: o.type, uri: o.uri }))
+        });
+      }
+
+      return this.success({
+        activated: true,
+        name: args.name,
+        group: group.toUpperCase(),
+        activatedObjects: refs.map(r => r.name),
+        ...(verified ? {} : { warning: 'Could not read the inactive-objects list after activation — check with abap_inactive_objects.' }),
+        dependentsStillInactive: []
       });
     } catch (error: any) {
       this.fail(formatError(`abap_activate(${args.name})`, error));

@@ -22,8 +22,10 @@ This fork ([marikpro-sudo/dassian-adt](https://github.com/marikpro-sudo/dassian-
 | `abap_get_dump` | Reads the ST22 dump feed on 7.40: time, user, error, program and the place of the failure. |
 | `abap_inactive_objects` | Reads the flat list that 7.40 returns instead of the newer structure. |
 | `abap_get_source`, `abap_set_source` with `FUGR/I` | The include URL is built directly when `fugr` is given, because the type search for `FUGR/I` is empty on 7.40. |
+| `abap_activate` with `FUGR`, `FUGR/FF`, `FUGR/I` | On 7.40 an activation reference activates only the object it points to, so sending the group alone answered "activated" and left function modules and includes inactive. The request now lists the group, the requested object and everything else inactive in the group, and the inactive-objects list is read again afterwards: `activated: false` with `stillInactive` if something stayed inactive. `fugr` is required for `FUGR/FF` and `FUGR/I`. |
+| `abap_delete` | Releases the lock after the delete. On 7.40 the delete left an enqueue on the program name that survived logout and blocked re-creating or deleting an object with the same name. |
 
-Replies of `abap_atc_run`, `abap_where_used` and `abap_inactive_objects` that took a 7.40 path are marked `mode: "legacy"`. Each patch has unit tests under `src/__tests__/unit/` (`atcLegacy`, `whereUsedLegacy`, `dumpFeed`, `inactiveLegacy`).
+Replies of `abap_atc_run`, `abap_where_used` and `abap_inactive_objects` that took a 7.40 path are marked `mode: "legacy"`. Each patch has unit tests under `src/__tests__/unit/` (`atcLegacy`, `whereUsedLegacy`, `dumpFeed`, `inactiveLegacy`, `fugrActivation`).
 
 Observed on our 7.40 system and **not** fixed here:
 
